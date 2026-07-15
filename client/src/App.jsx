@@ -1,6 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import QRCode from "qrcode";
 import { api, getToken, saveToken, uploadImage } from "./api.js";
 import { createQuizSocket } from "./socket.js";
+import { isSoundEnabled, playSound, setSoundEnabled } from "./sounds.js";
+
+const LIVE_ROOM_KEY = "quizora_live_room";
 
 const emptyQuiz = {
   title: "",
@@ -29,9 +33,54 @@ function ErrorMessage({ error }) {
   return error ? <div className="notice notice-error">{error}</div> : null;
 }
 
+function SoundToggle() {
+  const [enabled, setEnabled] = useState(isSoundEnabled());
+  function toggle() {
+    const next = !enabled;
+    setEnabled(next);
+    setSoundEnabled(next);
+    if (next) playSound("join");
+  }
+  return <button className="sound-toggle" type="button" onClick={toggle} title="Звуковые сигналы">{enabled ? "🔊 Звук" : "🔇 Без звука"}</button>;
+}
+
+function RoomQr({ code }) {
+  const [source, setSource] = useState("");
+  const [copied, setCopied] = useState(false);
+  const joinUrl = `${window.location.origin}/?room=${code}`;
+  useEffect(() => {
+    QRCode.toDataURL(joinUrl, { width: 220, margin: 1, color: { dark: "#172033", light: "#ffffff" } })
+      .then(setSource).catch(() => setSource(""));
+  }, [joinUrl]);
+  async function copyLink() {
+    await navigator.clipboard?.writeText(joinUrl);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  }
+  return (
+    <div className="room-qr">
+      {source && <img src={source} alt={`QR-код комнаты ${code}`} />}
+      <div><strong>Вход без регистрации</strong><span>Отсканируйте камерой телефона</span><button type="button" onClick={copyLink}>{copied ? "Ссылка скопирована ✓" : "Скопировать ссылку"}</button></div>
+    </div>
+  );
+}
+
+function StatsSummary({ stats }) {
+  if (!stats) return null;
+  return (
+    <div className="stats-summary">
+      <div><strong>{stats.playerCount}</strong><span>участников</span></div>
+      <div><strong>{stats.accuracy}%</strong><span>точность</span></div>
+      <div><strong>{(stats.averageResponseMs / 1000).toFixed(1)} с</strong><span>средний ответ</span></div>
+      {stats.hardestQuestion && <div className="hardest-stat"><strong>Сложнее всего</strong><span>{stats.hardestQuestion.text} · {stats.hardestQuestion.accuracy}%</span></div>}
+    </div>
+  );
+}
+
 function AuthScreen({ onAuthenticated }) {
-  const [mode, setMode] = useState("login");
-  const [form, setForm] = useState({ name: "", email: "", password: "", role: "PARTICIPANT" });
+  const roomFromLink = new URLSearchParams(window.location.search).get("room")?.replace(/\D/g, "").slice(0, 6) || "";
+  const [mode, setMode] = useState(roomFromLink ? "guest" : "login");
+  const [form, setForm] = useState({ name: "", email: "", password: "", role: "PARTICIPANT", roomCode: roomFromLink });
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -66,9 +115,15 @@ function AuthScreen({ onAuthenticated }) {
         <form className="auth-card" onSubmit={submit}>
           <div className="mobile-brand brand"><span>Q</span> Quizora</div>
           <p className="eyebrow">Добро пожаловать</p>
-          <h2>{mode === "login" ? "Войдите в аккаунт" : "Создайте аккаунт"}</h2>
-          <p className="muted">{mode === "login" ? "Продолжите игру или создайте новый квиз" : "Это займёт меньше минуты"}</p>
+          <h2>{mode === "guest" ? "Войдите гостем" : mode === "login" ? "Войдите в аккаунт" : "Создайте аккаунт"}</h2>
+          <p className="muted">{mode === "guest" ? "Нужны только имя и код комнаты" : mode === "login" ? "Продолжите игру или создайте новый квиз" : "Это займёт меньше минуты"}</p>
           <ErrorMessage error={error} />
+          {mode === "guest" && (
+            <>
+              <Field label="Ваше имя"><input autoFocus value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Алексей" required /></Field>
+              <Field label="Код комнаты"><input className="guest-code-input" inputMode="numeric" maxLength="6" value={form.roomCode} onChange={(e) => setForm({ ...form, roomCode: e.target.value.replace(/\D/g, "") })} placeholder="000000" required /></Field>
+            </>
+          )}
           {mode === "register" && (
             <>
               <Field label="Ваше имя"><input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Алексей" required /></Field>
@@ -80,12 +135,15 @@ function AuthScreen({ onAuthenticated }) {
               </Field>
             </>
           )}
-          <Field label="Email"><input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="you@example.com" required /></Field>
-          <Field label="Пароль"><input type="password" minLength="6" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="Минимум 6 символов" required /></Field>
-          <Button type="submit" disabled={loading}>{loading ? "Подождите…" : mode === "login" ? "Войти" : "Зарегистрироваться"}</Button>
-          <button type="button" className="text-button" onClick={() => { setMode(mode === "login" ? "register" : "login"); setError(""); }}>
-            {mode === "login" ? "Нет аккаунта? Зарегистрироваться" : "Уже есть аккаунт? Войти"}
-          </button>
+          {mode !== "guest" && <Field label="Email"><input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="you@example.com" required /></Field>}
+          {mode !== "guest" && <Field label="Пароль"><input type="password" minLength="6" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="Минимум 6 символов" required /></Field>}
+          <Button type="submit" disabled={loading || (mode === "guest" && form.roomCode.length !== 6)}>{loading ? "Подождите…" : mode === "guest" ? "Войти в комнату →" : mode === "login" ? "Войти" : "Зарегистрироваться"}</Button>
+          <div className="auth-switches">
+            <button type="button" className="text-button" onClick={() => { setMode(mode === "login" ? "register" : "login"); setError(""); }}>
+              {mode === "login" ? "Нет аккаунта? Зарегистрироваться" : "Войти с аккаунтом"}
+            </button>
+            {mode !== "guest" && <button type="button" className="text-button guest-switch" onClick={() => { setMode("guest"); setError(""); }}>Играть без регистрации</button>}
+          </div>
           <div className="demo-hint">Демо: organizer@quizora.local или player@quizora.local · пароль quiz123</div>
         </form>
       </section>
@@ -150,6 +208,7 @@ function QuestionForm({ quizId, onUpdated, onCancel }) {
   const [type, setType] = useState("SINGLE");
   const [options, setOptions] = useState(["", ""]);
   const [correct, setCorrect] = useState([]);
+  const [explanation, setExplanation] = useState("");
   const [image, setImage] = useState(null);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
@@ -172,7 +231,7 @@ function QuestionForm({ quizId, onUpdated, onCancel }) {
       if (image) imageUrl = (await uploadImage(image)).url;
       const data = await api(`/quizzes/${quizId}/questions`, {
         method: "POST",
-        body: JSON.stringify({ text, type, options, correctAnswers: correct, imageUrl })
+        body: JSON.stringify({ text, type, options, correctAnswers: correct, imageUrl, explanation })
       });
       onUpdated(data.quiz);
     } catch (requestError) {
@@ -202,6 +261,7 @@ function QuestionForm({ quizId, onUpdated, onCancel }) {
         ))}
       </div>
       {options.length < 8 && <button type="button" className="add-option" onClick={() => setOptions([...options, ""])}>＋ Добавить вариант</button>}
+      <Field label="Пояснение после ответа" hint="Покажем участникам после закрытия вопроса."><textarea rows="3" maxLength="600" value={explanation} onChange={(e) => setExplanation(e.target.value)} placeholder="Почему этот ответ правильный?" /></Field>
       <p className="form-tip">Нажмите на номер варианта, чтобы отметить правильный ответ.</p>
       <div className="modal-actions"><Button type="button" variant="ghost" onClick={onCancel}>Отмена</Button><Button type="submit" disabled={saving}>{saving ? "Сохраняю…" : "Добавить вопрос"}</Button></div>
     </form>
@@ -256,6 +316,7 @@ function QuizEditor({ quiz: initialQuiz, onBack, onChanged, onLaunch }) {
                   <div className="question-meta"><span>{question.type === "MULTIPLE" ? "Несколько ответов" : "Один ответ"}</span>{question.imageUrl && <span>С изображением</span>}</div>
                   <h3>{question.text}</h3>
                   <div className="answer-preview">{question.options.map((option, optionIndex) => <span className={question.correctAnswers.includes(optionIndex) ? "right" : ""} key={optionIndex}>{question.correctAnswers.includes(optionIndex) && "✓ "}{option}</span>)}</div>
+                  {question.explanation && <p className="question-explanation-preview">💡 {question.explanation}</p>}
                 </div>
                 <button className="icon-button danger" onClick={() => removeQuestion(question.id)} title="Удалить">×</button>
               </article>
@@ -295,7 +356,7 @@ function OrganizerDashboard({ socket, onLiveRoom }) {
   function launch(quizId) {
     socket.emit("host:create", { quizId }, (result) => {
       if (result.error) return setError(result.error);
-      onLiveRoom({ role: "host", ...result.room });
+      onLiveRoom({ role: "host", ...result.room, resume: result.resume });
     });
   }
 
@@ -327,6 +388,7 @@ function Countdown({ endsAt }) {
     const timer = setInterval(() => setSeconds(Math.max(0, Math.ceil((endsAt - Date.now()) / 1000))), 250);
     return () => clearInterval(timer);
   }, [endsAt]);
+  useEffect(() => { if (seconds > 0 && seconds <= 5) playSound("tick"); }, [seconds]);
   return <div className={`countdown ${seconds <= 5 ? "urgent" : ""}`}>{seconds}</div>;
 }
 
@@ -340,19 +402,22 @@ function Leaderboard({ rows = [], currentUserId }) {
 }
 
 function HostRoom({ socket, room, onExit }) {
+  const resume = room.resume || {};
   const [state, setState] = useState(room);
-  const [question, setQuestion] = useState(null);
-  const [leaderboard, setLeaderboard] = useState([]);
+  const [question, setQuestion] = useState(resume.question || null);
+  const [leaderboard, setLeaderboard] = useState(resume.closedData?.leaderboard || resume.leaderboard || []);
   const [answerCount, setAnswerCount] = useState(0);
-  const [closed, setClosed] = useState(false);
-  const [finished, setFinished] = useState(false);
+  const [closed, setClosed] = useState(Boolean(resume.closedData));
+  const [finished, setFinished] = useState(Boolean(resume.finished));
+  const [roundData, setRoundData] = useState(resume.closedData || null);
+  const [finalStats, setFinalStats] = useState(resume.stats || null);
   const [error, setError] = useState("");
 
   useEffect(() => {
     const onState = (next) => setState(next);
-    const onQuestion = (next) => { setQuestion(next); setClosed(false); setAnswerCount(0); };
-    const onClosed = (data) => { setClosed(true); setLeaderboard(data.leaderboard); };
-    const onFinished = (data) => { setFinished(true); setLeaderboard(data.leaderboard); };
+    const onQuestion = (next) => { setQuestion(next); setClosed(false); setRoundData(null); setAnswerCount(0); playSound("question"); };
+    const onClosed = (data) => { setClosed(true); setRoundData(data); setLeaderboard(data.leaderboard); playSound("closed"); };
+    const onFinished = (data) => { setFinished(true); setLeaderboard(data.leaderboard); setFinalStats(data.stats); playSound("finish"); };
     const onCount = (data) => setAnswerCount(data.count);
     socket.on("room:state", onState);
     socket.on("quiz:question", onQuestion);
@@ -363,18 +428,20 @@ function HostRoom({ socket, room, onExit }) {
   }, [socket]);
 
   function emit(event) {
+    playSound("join");
     socket.emit(event, { code: state.code }, (result) => result?.error && setError(result.error));
   }
 
-  if (finished) return <main className="live-stage"><div className="results-card"><div className="trophy">🏆</div><p className="eyebrow">Квиз завершён</p><h1>Финальный рейтинг</h1><Leaderboard rows={leaderboard} /><Button onClick={onExit}>Вернуться к квизам</Button></div></main>;
+  if (finished) return <main className="live-stage"><div className="results-card wide-results"><div className="trophy">🏆</div><p className="eyebrow">Квиз завершён</p><h1>Финальный рейтинг</h1><StatsSummary stats={finalStats} /><Leaderboard rows={leaderboard} /><Button onClick={onExit}>Вернуться к квизам</Button></div></main>;
 
   return (
     <main className="live-stage host-stage">
-      <div className="live-top"><div className="brand light"><span>Q</span> Quizora live</div><div className="room-code-small">Код <strong>{state.code}</strong></div><Button variant="danger" onClick={() => emit("host:finish")}>Завершить</Button></div>
+      <div className="live-top"><div className="brand light"><span>Q</span> Quizora live</div><div className="room-code-small">Код <strong>{state.code}</strong></div><SoundToggle /><Button variant="danger" onClick={() => emit("host:finish")}>Завершить</Button></div>
       <ErrorMessage error={error} />
       {!question ? (
         <section className="lobby-card">
-          <p className="eyebrow">Комната готова</p><h1>Код подключения</h1><div className="big-code">{state.code}</div><p>Участники вводят код на главном экране.</p>
+          <p className="eyebrow">Комната готова</p><h1>Код подключения</h1><div className="big-code">{state.code}</div><p>Участники вводят код или сканируют QR-код.</p>
+          <RoomQr code={state.code} />
           <div className="players"><strong>В комнате: {state.players?.length || 0}</strong>{state.players?.map((player) => <span key={player.id}>{player.name}</span>)}</div>
           <Button onClick={() => emit("host:start")} disabled={!state.players?.length}>Начать квиз</Button>
         </section>
@@ -384,10 +451,12 @@ function HostRoom({ socket, room, onExit }) {
             <div className="question-live-head"><span>Вопрос {question.index + 1} / {question.total}</span><Countdown endsAt={question.endsAt} /></div>
             {question.imageUrl && <img src={question.imageUrl} alt="Иллюстрация к вопросу" />}
             <h1>{question.text}</h1>
-            <div className="live-options">{question.options.map((option, index) => <div key={index}><span>{String.fromCharCode(65 + index)}</span>{option}</div>)}</div>
+            <div className="live-options">{question.options.map((option, index) => <div className={closed && roundData?.correctAnswers.includes(index) ? "correct" : ""} key={index}><span>{String.fromCharCode(65 + index)}</span>{option}</div>)}</div>
+            {closed && roundData?.explanation && <div className="explanation-card"><strong>Почему это правильно</strong><p>{roundData.explanation}</p></div>}
           </section>
           <aside className="live-sidebar">
             <div className="answer-meter"><span>Ответили</span><strong>{answerCount} / {state.players?.length || 0}</strong><div><i style={{ width: `${state.players?.length ? Math.min(100, answerCount / state.players.length * 100) : 0}%` }} /></div></div>
+            {closed && roundData?.stats && <div className="round-analytics"><div><strong>{roundData.stats.accuracy}%</strong><span>ответили верно</span></div><div><strong>{(roundData.stats.averageResponseMs / 1000).toFixed(1)} с</strong><span>среднее время</span></div>{roundData.stats.distribution.map((count, index) => <div className="distribution-row" key={index}><span>{String.fromCharCode(65 + index)}</span><i><b style={{ width: `${roundData.stats.answerCount ? count / roundData.stats.answerCount * 100 : 0}%` }} /></i><em>{count}</em></div>)}</div>}
             <h3>Лидерборд</h3><Leaderboard rows={leaderboard} />
             {closed ? <Button onClick={() => emit("host:next")}>{question.index + 1 === question.total ? "Показать результаты" : "Следующий вопрос →"}</Button> : <Button variant="secondary" onClick={() => emit("host:next")}>Закрыть и продолжить</Button>}
           </aside>
@@ -398,34 +467,42 @@ function HostRoom({ socket, room, onExit }) {
 }
 
 function PlayerRoom({ socket, room, user, onExit }) {
+  const resume = room.resume || {};
   const [state, setState] = useState(room);
-  const [question, setQuestion] = useState(null);
-  const [selected, setSelected] = useState([]);
-  const [submitted, setSubmitted] = useState(false);
-  const [message, setMessage] = useState("");
-  const [leaderboard, setLeaderboard] = useState([]);
-  const [closed, setClosed] = useState(false);
-  const [finished, setFinished] = useState(false);
+  const [question, setQuestion] = useState(resume.question || null);
+  const [selected, setSelected] = useState(resume.question?.selectedAnswers || []);
+  const [submitted, setSubmitted] = useState(Boolean(resume.question?.alreadyAnswered));
+  const [message, setMessage] = useState(resume.question?.alreadyAnswered ? "Ваш ответ уже принят" : "");
+  const [leaderboard, setLeaderboard] = useState(resume.closedData?.leaderboard || resume.leaderboard || []);
+  const [closed, setClosed] = useState(Boolean(resume.closedData));
+  const [finished, setFinished] = useState(Boolean(resume.finished));
+  const [roundData, setRoundData] = useState(resume.closedData || null);
+  const selectedRef = useRef(resume.question?.selectedAnswers || []);
+  const pointsRef = useRef(resume.question?.awardedPoints || 0);
 
   useEffect(() => {
     const onState = (next) => setState(next);
-    const onQuestion = (next) => { setQuestion(next); setSelected([]); setSubmitted(Boolean(next.alreadyAnswered)); setMessage(next.alreadyAnswered ? "Ваш ответ уже принят" : ""); setClosed(false); };
-    const onClosed = (data) => { setClosed(true); setLeaderboard(data.leaderboard); };
-    const onFinished = (data) => { setFinished(true); setLeaderboard(data.leaderboard); };
+    const onQuestion = (next) => { const restored = next.selectedAnswers || []; selectedRef.current = restored; pointsRef.current = next.awardedPoints || 0; setQuestion(next); setSelected(restored); setSubmitted(Boolean(next.alreadyAnswered)); setMessage(next.alreadyAnswered ? "Ваш ответ уже принят" : ""); setClosed(false); setRoundData(null); playSound("question"); };
+    const onClosed = (data) => { const chosen = [...selectedRef.current].sort((a, b) => a - b); const correct = [...data.correctAnswers].sort((a, b) => a - b); const isCorrect = chosen.length === correct.length && chosen.every((value, index) => value === correct[index]); setClosed(true); setRoundData(data); setLeaderboard(data.leaderboard); setMessage(isCorrect ? `Верно${pointsRef.current ? ` · +${pointsRef.current} баллов` : ""}` : "Неверно — правильный ответ отмечен ниже"); playSound(isCorrect ? "correct" : "wrong"); };
+    const onFinished = (data) => { setFinished(true); setLeaderboard(data.leaderboard); playSound("finish"); };
     socket.on("room:state", onState); socket.on("quiz:question", onQuestion); socket.on("quiz:question-closed", onClosed); socket.on("quiz:finished", onFinished);
     return () => { socket.off("room:state", onState); socket.off("quiz:question", onQuestion); socket.off("quiz:question-closed", onClosed); socket.off("quiz:finished", onFinished); };
   }, [socket]);
 
   function toggle(index) {
     if (submitted || closed) return;
-    setSelected(question.type === "SINGLE" ? [index] : selected.includes(index) ? selected.filter((item) => item !== index) : [...selected, index]);
+    const next = question.type === "SINGLE" ? [index] : selected.includes(index) ? selected.filter((item) => item !== index) : [...selected, index];
+    selectedRef.current = next;
+    setSelected(next);
   }
 
   function answer() {
     socket.emit("player:answer", { code: state.code, questionId: question.id, answers: selected }, (result) => {
       if (result.error) return setMessage(result.error);
+      pointsRef.current = result.points || 0;
       setSubmitted(true);
-      setMessage(`Ответ принят${result.points ? ` · +${result.points} баллов` : ""}`);
+      setMessage("Ответ принят — результат появится после закрытия вопроса");
+      playSound("join");
     });
   }
 
@@ -438,14 +515,15 @@ function PlayerRoom({ socket, room, user, onExit }) {
 
   return (
     <main className="live-stage player-stage">
-      <div className="player-live-head"><span>Вопрос {question.index + 1} из {question.total}</span><Countdown endsAt={question.endsAt} /></div>
+      <div className="player-live-head"><span>Вопрос {question.index + 1} из {question.total}</span><SoundToggle /><Countdown endsAt={question.endsAt} /></div>
       <section className="player-question">
         {question.imageUrl && <img src={question.imageUrl} alt="Иллюстрация к вопросу" />}
         <h1>{question.text}</h1>
         {question.type === "MULTIPLE" && <p className="muted">Можно выбрать несколько вариантов</p>}
-        <div className="player-options">{question.options.map((option, index) => <button className={selected.includes(index) ? "selected" : ""} disabled={submitted || closed} onClick={() => toggle(index)} key={index}><span>{String.fromCharCode(65 + index)}</span>{option}</button>)}</div>
+        <div className="player-options">{question.options.map((option, index) => <button className={`${selected.includes(index) ? "selected" : ""} ${closed && roundData?.correctAnswers.includes(index) ? "correct" : ""} ${closed && selected.includes(index) && !roundData?.correctAnswers.includes(index) ? "wrong" : ""}`} disabled={submitted || closed} onClick={() => toggle(index)} key={index}><span>{String.fromCharCode(65 + index)}</span>{option}</button>)}</div>
         {message && <div className={`answer-message ${submitted ? "success" : ""}`}>{message}</div>}
         {!closed && <Button className="answer-button" onClick={answer} disabled={!selected.length || submitted}>{submitted ? "Ответ принят ✓" : "Ответить"}</Button>}
+        {closed && roundData?.explanation && <div className="explanation-card"><strong>Почему это правильно</strong><p>{roundData.explanation}</p></div>}
         {closed && <div className="round-results"><p className="eyebrow">Промежуточный рейтинг</p><Leaderboard rows={leaderboard} currentUserId={user.id} /><p className="muted center">Следующий вопрос скоро появится</p></div>}
       </section>
     </main>
@@ -453,7 +531,7 @@ function PlayerRoom({ socket, room, user, onExit }) {
 }
 
 function ParticipantHome({ socket, onLiveRoom }) {
-  const [code, setCode] = useState("");
+  const [code, setCode] = useState(() => new URLSearchParams(window.location.search).get("room")?.replace(/\D/g, "").slice(0, 6) || "");
   const [error, setError] = useState("");
   const [joining, setJoining] = useState(false);
 
@@ -463,7 +541,8 @@ function ParticipantHome({ socket, onLiveRoom }) {
     socket.emit("player:join", { code }, (result) => {
       setJoining(false);
       if (result.error) return setError(result.error);
-      onLiveRoom({ role: "player", ...result.room });
+      playSound("join");
+      onLiveRoom({ role: "player", ...result.room, resume: result.resume });
     });
   }
 
@@ -499,6 +578,9 @@ export default function App() {
   const [checking, setChecking] = useState(Boolean(token));
   const [page, setPage] = useState("main");
   const [liveRoom, setLiveRoom] = useState(null);
+  const [pendingJoinCode, setPendingJoinCode] = useState(() => new URLSearchParams(window.location.search).get("room")?.replace(/\D/g, "").slice(0, 6) || "");
+  const resumeAttempted = useRef(false);
+  const joiningFromLink = useRef(false);
 
   const socket = useMemo(() => token ? createQuizSocket(token) : null, [token]);
 
@@ -507,24 +589,80 @@ export default function App() {
     api("/auth/me").then((data) => setUser(data.user)).catch(() => { saveToken(null); setToken(null); }).finally(() => setChecking(false));
   }, [token]);
 
-  useEffect(() => () => socket?.disconnect(), [socket]);
+  useEffect(() => {
+    if (!socket) return undefined;
+    socket.connect();
+    return () => socket.disconnect();
+  }, [socket]);
+
+  useEffect(() => {
+    if (!socket || !user || user.role !== "PARTICIPANT" || liveRoom || !pendingJoinCode) return undefined;
+    const join = () => {
+      if (joiningFromLink.current) return;
+      joiningFromLink.current = true;
+      socket.emit("player:join", { code: pendingJoinCode }, (result) => {
+        joiningFromLink.current = false;
+        setPendingJoinCode("");
+        if (result?.error) return;
+        enterLiveRoom({ role: "player", ...result.room, resume: result.resume });
+        playSound("join");
+      });
+    };
+    if (socket.connected) join();
+    else socket.on("connect", join);
+    return () => socket.off("connect", join);
+  }, [socket, user, liveRoom, pendingJoinCode]);
+
+  useEffect(() => {
+    if (!socket || !user || liveRoom || pendingJoinCode) return undefined;
+    const resume = () => {
+      if (resumeAttempted.current) return;
+      resumeAttempted.current = true;
+      try {
+        const saved = JSON.parse(localStorage.getItem(LIVE_ROOM_KEY) || "null");
+        if (!saved?.code) return;
+        socket.emit("room:resume", { code: saved.code }, (result) => {
+          if (result?.error) return localStorage.removeItem(LIVE_ROOM_KEY);
+          setLiveRoom({ role: result.role, ...result.room, resume: result.resume });
+        });
+      } catch {
+        localStorage.removeItem(LIVE_ROOM_KEY);
+      }
+    };
+    if (socket.connected) resume();
+    else socket.on("connect", resume);
+    return () => socket.off("connect", resume);
+  }, [socket, user, liveRoom, pendingJoinCode]);
+
+  function enterLiveRoom(room) {
+    localStorage.setItem(LIVE_ROOM_KEY, JSON.stringify({ role: room.role, code: room.code }));
+    if (window.location.search) window.history.replaceState({}, "", window.location.pathname);
+    setLiveRoom(room);
+  }
+
+  function leaveLiveRoom() {
+    localStorage.removeItem(LIVE_ROOM_KEY);
+    setLiveRoom(null);
+  }
 
   function authenticated(data) {
+    resumeAttempted.current = false;
     saveToken(data.token); setToken(data.token); setUser(data.user); setChecking(false);
+    if (data.roomCode) setPendingJoinCode(data.roomCode);
   }
 
   function logout() {
-    socket?.disconnect(); saveToken(null); setToken(null); setUser(null); setLiveRoom(null); setPage("main");
+    socket?.disconnect(); saveToken(null); localStorage.removeItem(LIVE_ROOM_KEY); setToken(null); setUser(null); setLiveRoom(null); setPage("main");
   }
 
   if (checking) return <div className="loading-screen"><div className="pulse-logo">Q</div></div>;
   if (!user) return <AuthScreen onAuthenticated={authenticated} />;
-  if (liveRoom?.role === "host") return <HostRoom socket={socket} room={liveRoom} onExit={() => setLiveRoom(null)} />;
-  if (liveRoom?.role === "player") return <PlayerRoom socket={socket} room={liveRoom} user={user} onExit={() => setLiveRoom(null)} />;
+  if (liveRoom?.role === "host") return <HostRoom socket={socket} room={liveRoom} onExit={leaveLiveRoom} />;
+  if (liveRoom?.role === "player") return <PlayerRoom socket={socket} room={liveRoom} user={user} onExit={leaveLiveRoom} />;
 
   return (
     <AppShell user={user} onLogout={logout} page={page} setPage={setPage}>
-      {page === "history" ? <History user={user} /> : user.role === "ORGANIZER" ? <OrganizerDashboard socket={socket} onLiveRoom={setLiveRoom} /> : <ParticipantHome socket={socket} onLiveRoom={setLiveRoom} />}
+      {page === "history" ? <History user={user} /> : user.role === "ORGANIZER" ? <OrganizerDashboard socket={socket} onLiveRoom={enterLiveRoom} /> : <ParticipantHome socket={socket} onLiveRoom={enterLiveRoom} />}
     </AppShell>
   );
 }

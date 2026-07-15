@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,7 +41,16 @@ function validateQuestion(payload) {
   if (options.length < 2 || options.length > 8) return { error: "Добавьте от 2 до 8 вариантов" };
   if (!correctAnswers.length || correctAnswers.some((index) => index < 0 || index >= options.length)) return { error: "Отметьте правильный ответ" };
   if (type === "SINGLE" && correctAnswers.length !== 1) return { error: "Для одиночного выбора нужен один правильный ответ" };
-  return { value: { text, type, options, correctAnswers, imageUrl: payload.imageUrl || null } };
+  return {
+    value: {
+      text,
+      type,
+      options,
+      correctAnswers,
+      imageUrl: payload.imageUrl || null,
+      explanation: String(payload.explanation || "").trim().slice(0, 600)
+    }
+  };
 }
 
 export function createApp() {
@@ -74,6 +84,20 @@ export function createApp() {
       return res.status(401).json({ error: "Неверный email или пароль" });
     }
     res.json({ token: createToken(user), user: publicUser(user) });
+  });
+
+  app.post("/api/auth/guest", (req, res) => {
+    const name = String(req.body.name || "").trim().slice(0, 40);
+    const roomCode = String(req.body.roomCode || "").replace(/\D/g, "").slice(0, 6);
+    if (name.length < 2) return res.status(400).json({ error: "Введите имя минимум из 2 символов" });
+    const session = db.prepare("SELECT status FROM quiz_sessions WHERE room_code = ?").get(roomCode);
+    if (!session) return res.status(404).json({ error: "Комната не найдена" });
+    if (session.status === "FINISHED") return res.status(409).json({ error: "Квиз уже завершён" });
+    const guestId = crypto.randomUUID();
+    const result = db.prepare("INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, 'PARTICIPANT')")
+      .run(name, `${guestId}@guest.quizora.local`, `guest-${guestId}`);
+    const user = db.prepare("SELECT * FROM users WHERE id = ?").get(result.lastInsertRowid);
+    res.status(201).json({ token: createToken(user), user: publicUser(user), roomCode });
   });
 
   app.get("/api/auth/me", requireAuth, (req, res) => res.json({ user: req.user }));
@@ -126,9 +150,9 @@ export function createApp() {
       .get(req.quiz.id).position;
     const value = parsed.value;
     db.prepare(`
-      INSERT INTO questions (quiz_id, text, image_url, type, options_json, correct_answers_json, position)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(req.quiz.id, value.text, value.imageUrl, value.type, JSON.stringify(value.options), JSON.stringify(value.correctAnswers), nextPosition);
+      INSERT INTO questions (quiz_id, text, image_url, type, options_json, correct_answers_json, explanation, position)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(req.quiz.id, value.text, value.imageUrl, value.type, JSON.stringify(value.options), JSON.stringify(value.correctAnswers), value.explanation, nextPosition);
     res.status(201).json({ quiz: getQuizWithQuestions(req.quiz.id, true) });
   });
 
@@ -138,8 +162,8 @@ export function createApp() {
     const parsed = validateQuestion(req.body);
     if (parsed.error) return res.status(400).json({ error: parsed.error });
     const value = parsed.value;
-    db.prepare(`UPDATE questions SET text = ?, image_url = ?, type = ?, options_json = ?, correct_answers_json = ? WHERE id = ?`)
-      .run(value.text, value.imageUrl, value.type, JSON.stringify(value.options), JSON.stringify(value.correctAnswers), question.id);
+    db.prepare(`UPDATE questions SET text = ?, image_url = ?, type = ?, options_json = ?, correct_answers_json = ?, explanation = ? WHERE id = ?`)
+      .run(value.text, value.imageUrl, value.type, JSON.stringify(value.options), JSON.stringify(value.correctAnswers), value.explanation, question.id);
     res.json({ quiz: getQuizWithQuestions(req.quiz.id, true) });
   });
 

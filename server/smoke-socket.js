@@ -52,11 +52,22 @@ try {
   const answer = await emitAck(player, "player:answer", { code: created.room.code, questionId: question.id, answers: [0] });
   if (answer.error || answer.points <= 0) throw new Error(answer.error || "Баллы не начислены");
 
+  const reconnected = io(baseUrl, { auth: { token: participant.token }, transports: ["websocket"] });
+  try {
+    await connected(reconnected);
+    const resumed = await emitAck(reconnected, "room:resume", { code: created.room.code });
+    if (!resumed.ok || resumed.role !== "player" || !resumed.resume?.question?.alreadyAnswered) {
+      throw new Error("Состояние участника после переподключения не восстановлено");
+    }
+  } finally {
+    reconnected.disconnect();
+  }
+
   const finishedForPlayer = nextEvent(player, "quiz:finished");
   const finished = await emitAck(host, "host:finish", { code: created.room.code });
   const final = await finishedForPlayer;
   const playerResult = final.leaderboard.find((row) => row.userId === participant.user.id);
-  if (!finished.ok || !playerResult || playerResult.score <= 0) throw new Error("Итоговый рейтинг сформирован неверно");
+  if (!finished.ok || !playerResult || playerResult.score <= 0 || !final.stats?.playerCount) throw new Error("Итоговый рейтинг сформирован неверно");
   console.log(`Socket.IO smoke-test пройден: комната ${created.room.code}, ${playerResult.score} баллов`);
 } finally {
   host.disconnect();

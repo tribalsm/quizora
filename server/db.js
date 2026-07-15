@@ -85,6 +85,11 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_players_session ON session_players(session_id, score DESC);
 `);
 
+const questionColumns = new Set(db.prepare("PRAGMA table_info(questions)").all().map((column) => column.name));
+if (!questionColumns.has("explanation")) {
+  db.exec("ALTER TABLE questions ADD COLUMN explanation TEXT NOT NULL DEFAULT ''");
+}
+
 export function parseJson(value, fallback = []) {
   try {
     return JSON.parse(value);
@@ -95,7 +100,13 @@ export function parseJson(value, fallback = []) {
 
 export function publicUser(user) {
   if (!user) return null;
-  return { id: user.id, name: user.name, email: user.email, role: user.role };
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    isGuest: user.email.endsWith("@guest.quizora.local")
+  };
 }
 
 export function mapQuestion(row, includeAnswers = false) {
@@ -109,7 +120,10 @@ export function mapQuestion(row, includeAnswers = false) {
     options: parseJson(row.options_json),
     position: row.position
   };
-  if (includeAnswers) question.correctAnswers = parseJson(row.correct_answers_json);
+  if (includeAnswers) {
+    question.correctAnswers = parseJson(row.correct_answers_json);
+    question.explanation = row.explanation || "";
+  }
   return question;
 }
 
@@ -162,4 +176,66 @@ export function leaderboard(sessionId) {
     score: row.score,
     correctCount: row.correct_count
   }));
+}
+
+export function questionStats(sessionId, questionId) {
+  const question = db.prepare("SELECT options_json FROM questions WHERE id = ?").get(questionId);
+  const options = parseJson(question?.options_json);
+  const answers = db.prepare(`
+    SELECT answers_json, is_correct, response_ms
+    FROM answers WHERE session_id = ? AND question_id = ?
+  `).all(sessionId, questionId);
+  const playerCount = db.prepare("SELECT COUNT(*) AS count FROM session_players WHERE session_id = ?")
+    .get(sessionId).count;
+  const distribution = Array(options.length).fill(0);
+  for (const answer of answers) {
+    for (const index of parseJson(answer.answers_json)) {
+      if (Number.isInteger(index) && index >= 0 && index < distribution.length) distribution[index] += 1;
+    }
+  }
+  const correctCount = answers.filter((answer) => answer.is_correct).length;
+  const averageResponseMs = answers.length
+    ? Math.round(answers.reduce((sum, answer) => sum + answer.response_ms, 0) / answers.length)
+    : 0;
+  return {
+    playerCount,
+    answerCount: answers.length,
+    correctCount,
+    accuracy: answers.length ? Math.round(correctCount / answers.length * 100) : 0,
+    averageResponseMs,
+    distribution
+  };
+}
+
+export function sessionStats(sessionId) {
+  const summary = db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM session_players WHERE session_id = ?) AS player_count,
+      COUNT(a.id) AS answer_count,
+      COALESCE(SUM(a.is_correct), 0) AS correct_count,
+      COALESCE(AVG(a.response_ms), 0) AS average_response_ms
+    FROM answers a WHERE a.session_id = ?
+  `).get(sessionId, sessionId);
+  const questionCount = db.prepare(`
+    SELECT COUNT(*) AS count FROM questions q
+    JOIN quiz_sessions s ON s.quiz_id = q.quiz_id WHERE s.id = ?
+  `).get(sessionId).count;
+  const hardest = db.prepare(`
+    SELECT q.text, COUNT(a.id) AS answer_count, ROUND(AVG(a.is_correct) * 100) AS accuracy
+    FROM questions q
+    JOIN quiz_sessions s ON s.quiz_id = q.quiz_id
+    LEFT JOIN answers a ON a.question_id = q.id AND a.session_id = s.id
+    WHERE s.id = ?
+    GROUP BY q.id HAVING COUNT(a.id) > 0
+    ORDER BY accuracy ASC, q.position ASC LIMIT 1
+  `).get(sessionId);
+  return {
+    playerCount: Number(summary.player_count || 0),
+    questionCount: Number(questionCount || 0),
+    answerCount: Number(summary.answer_count || 0),
+    correctCount: Number(summary.correct_count || 0),
+    accuracy: summary.answer_count ? Math.round(summary.correct_count / summary.answer_count * 100) : 0,
+    averageResponseMs: Math.round(summary.average_response_ms || 0),
+    hardestQuestion: hardest ? { text: hardest.text, accuracy: Number(hardest.accuracy || 0) } : null
+  };
 }

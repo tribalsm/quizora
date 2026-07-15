@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { db, getQuizWithQuestions, leaderboard } from "./db.js";
+import { db, getQuizWithQuestions, leaderboard, questionStats, sessionStats } from "./db.js";
 
 const activeRooms = new Map();
 
@@ -42,15 +42,59 @@ function roomState(session) {
   };
 }
 
+function closedPayload(session, questionId) {
+  const question = db.prepare("SELECT correct_answers_json, explanation FROM questions WHERE id = ?").get(questionId);
+  return {
+    correctAnswers: JSON.parse(question.correct_answers_json),
+    explanation: question.explanation || "",
+    leaderboard: leaderboard(session.id),
+    stats: questionStats(session.id, questionId)
+  };
+}
+
+function questionPayload(session, runtime, user) {
+  const quiz = getQuizWithQuestions(session.quiz_id, false);
+  const question = quiz.questions[runtime.questionIndex];
+  if (!question) return null;
+  const existingAnswer = user.role === "PARTICIPANT" ? db.prepare(
+    "SELECT answers_json, points FROM answers WHERE session_id = ? AND question_id = ? AND user_id = ?"
+  ).get(session.id, question.id, user.id) : null;
+  return {
+    ...question,
+    index: runtime.questionIndex,
+    total: quiz.questions.length,
+    duration: quiz.questionTime,
+    endsAt: runtime.endsAt,
+    alreadyAnswered: Boolean(existingAnswer),
+    selectedAnswers: existingAnswer ? JSON.parse(existingAnswer.answers_json) : [],
+    awardedPoints: existingAnswer?.points || 0
+  };
+}
+
+function resumeSnapshot(session, user) {
+  if (session.status === "FINISHED") {
+    return { finished: true, leaderboard: leaderboard(session.id), stats: sessionStats(session.id) };
+  }
+  if (session.current_question < 0) return {};
+  const activeRuntime = activeRooms.get(session.room_code);
+  const runtime = activeRuntime || {
+    questionIndex: session.current_question,
+    questionId: getQuizWithQuestions(session.quiz_id, false).questions[session.current_question]?.id,
+    endsAt: Date.now(),
+    closed: true
+  };
+  if (!runtime.questionId) return {};
+  return {
+    question: questionPayload(session, runtime, user),
+    closedData: runtime.closed ? closedPayload(session, runtime.questionId) : null
+  };
+}
+
 function closeQuestion(io, session, runtime) {
   if (!runtime || runtime.closed) return;
   runtime.closed = true;
   if (runtime.timer) clearTimeout(runtime.timer);
-  const question = db.prepare("SELECT correct_answers_json FROM questions WHERE id = ?").get(runtime.questionId);
-  io.to(roomName(session.room_code)).emit("quiz:question-closed", {
-    correctAnswers: JSON.parse(question.correct_answers_json),
-    leaderboard: leaderboard(session.id)
-  });
+  io.to(roomName(session.room_code)).emit("quiz:question-closed", closedPayload(session, runtime.questionId));
 }
 
 function finishSession(io, session) {
@@ -59,9 +103,10 @@ function finishSession(io, session) {
   db.prepare("UPDATE quiz_sessions SET status = 'FINISHED', finished_at = datetime('now') WHERE id = ?")
     .run(session.id);
   const results = leaderboard(session.id);
-  io.to(roomName(session.room_code)).emit("quiz:finished", { leaderboard: results });
+  const stats = sessionStats(session.id);
+  io.to(roomName(session.room_code)).emit("quiz:finished", { leaderboard: results, stats });
   activeRooms.delete(session.room_code);
-  return results;
+  return { results, stats };
 }
 
 function startQuestion(io, session, questionIndex) {
@@ -136,23 +181,21 @@ export function attachRealtime(io) {
       socket.data.sessionId = session.id;
       const state = roomState(session);
       io.to(roomName(session.room_code)).emit("room:state", state);
-      respond(ack, { ok: true, room: state });
+      respond(ack, { ok: true, room: state, resume: resumeSnapshot(session, user) });
+    });
 
-      const runtime = activeRooms.get(session.room_code);
-      if (session.status === "ACTIVE" && runtime && !runtime.closed && Date.now() < runtime.endsAt) {
-        const quiz = getQuizWithQuestions(session.quiz_id, false);
-        const question = quiz.questions[runtime.questionIndex];
-        const alreadyAnswered = Boolean(db.prepare("SELECT 1 FROM answers WHERE session_id = ? AND question_id = ? AND user_id = ?")
-          .get(session.id, question.id, user.id));
-        socket.emit("quiz:question", {
-          ...question,
-          index: runtime.questionIndex,
-          total: quiz.questions.length,
-          duration: quiz.questionTime,
-          endsAt: runtime.endsAt,
-          alreadyAnswered
-        });
-      }
+    socket.on("room:resume", ({ code } = {}, ack) => {
+      const session = findSession(code);
+      if (!session) return respond(ack, { error: "Комната больше недоступна" });
+      let role = "player";
+      if (user.role === "ORGANIZER" && isHost(user, session)) role = "host";
+      else if (user.role !== "PARTICIPANT" || !db.prepare(
+        "SELECT 1 FROM session_players WHERE session_id = ? AND user_id = ?"
+      ).get(session.id, user.id)) return respond(ack, { error: "Участие в комнате не найдено" });
+      socket.join(roomName(session.room_code));
+      socket.data.roomCode = session.room_code;
+      socket.data.sessionId = session.id;
+      respond(ack, { ok: true, role, room: roomState(session), resume: resumeSnapshot(session, user) });
     });
 
     socket.on("host:start", ({ code } = {}, ack) => {
@@ -171,8 +214,8 @@ export function attachRealtime(io) {
       const quiz = getQuizWithQuestions(session.quiz_id, false);
       const nextIndex = session.current_question + 1;
       if (nextIndex >= quiz.questions.length) {
-        const results = finishSession(io, session);
-        return respond(ack, { ok: true, finished: true, leaderboard: results });
+        const { results, stats } = finishSession(io, session);
+        return respond(ack, { ok: true, finished: true, leaderboard: results, stats });
       }
       startQuestion(io, session, nextIndex);
       respond(ack, { ok: true });
@@ -181,8 +224,8 @@ export function attachRealtime(io) {
     socket.on("host:finish", ({ code } = {}, ack) => {
       const session = findSession(code);
       if (!session || !isHost(user, session)) return respond(ack, { error: "Комната не найдена" });
-      const results = finishSession(io, session);
-      respond(ack, { ok: true, leaderboard: results });
+      const { results, stats } = finishSession(io, session);
+      respond(ack, { ok: true, leaderboard: results, stats });
     });
 
     socket.on("player:answer", ({ code, questionId, answers } = {}, ack) => {
