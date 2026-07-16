@@ -12,6 +12,5 @@
 
   <!-- Open door cut into the Q tail -->
   <path d="M44 47.2 51 42l8.5 5V62H44V47.2Z" fill="#172033"/>
-  <path d="M49.5 50 53.5 48v14h-4V50Z" fill="#F7F6F2"/>
   <path d="M54.5 49 58.5 51.3V62h-4V49Z" fill="#C7F36B"/>
 </svg>
