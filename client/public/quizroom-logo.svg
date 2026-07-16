@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">QuizRoom</title>
+  <desc id="desc">Буква Q в форме комнаты с открытой дверью</desc>
+  <rect x="1.5" y="1.5" width="61" height="61" rx="18" fill="#172033" stroke="#C7F36B" stroke-width="1.5"/>
+  <path fill="#C7F36B" fill-rule="evenodd" d="M15 16.5A10.5 10.5 0 0 1 25.5 6h13A10.5 10.5 0 0 1 49 16.5v22.2l8 6.9V58h-9.1L39 50.5H25.5A10.5 10.5 0 0 1 15 40V16.5Zm10.5-2A4.5 4.5 0 0 0 21 19v18.5a4.5 4.5 0 0 0 4.5 4.5h15.7l7.8 6.6V19a4.5 4.5 0 0 0-4.5-4.5h-19Z"/>
+  <path d="M50 46.3 55 50v8h-5V46.3Z" fill="#F6F5F1"/>
+</svg>
